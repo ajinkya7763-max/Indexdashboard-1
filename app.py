@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
 
 # ============================================================
 # INDEX SIGNAL DASHBOARD — PAPER TRADING ONLY
@@ -670,6 +671,80 @@ def update_open_trades(latest_prices, trailing_levels):
             )
     CON.commit()
 
+
+def render_price_chart(symbol, sig, interval="5m"):
+    """Render an interactive candlestick chart with available overlays."""
+    md = sig.get("data", {})
+    raw = md.get(interval, pd.DataFrame())
+    if raw is None or raw.empty:
+        st.warning(
+            f"No {interval} candles are available for {symbol}. "
+            "The chart cannot render until Yahoo Finance returns OHLC data."
+        )
+        return
+
+    chart_df = add_indicators(raw.copy()).tail(180)
+    if chart_df.empty:
+        st.warning("Not enough OHLC data to draw the chart.")
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=chart_df.index,
+        open=chart_df["open"], high=chart_df["high"],
+        low=chart_df["low"], close=chart_df["close"],
+        name=f"{symbol} candles",
+        increasing_line_color="#22c55e",
+        decreasing_line_color="#ef4444"
+    ))
+
+    overlay_styles = {
+        "ema9": ("EMA 9", "#facc15"),
+        "ema20": ("EMA 20", "#38bdf8"),
+        "ema50": ("EMA 50", "#c084fc"),
+        "vwap": ("VWAP", "#fb923c"),
+    }
+    for col, (label, color) in overlay_styles.items():
+        if col in chart_df.columns and chart_df[col].notna().any():
+            fig.add_trace(go.Scatter(
+                x=chart_df.index, y=chart_df[col], mode="lines",
+                name=label, line={"width": 1.5, "color": color}
+            ))
+
+    # Add prior-day reference levels when the signal engine has calculated them.
+    levels = sig.get("levels", {}) or {}
+    level_styles = {
+        "PDH": "#16a34a", "PDL": "#dc2626", "PDC": "#94a3b8",
+        "P": "#eab308", "R1": "#f97316", "S1": "#0ea5e9"
+    }
+    for key, color in level_styles.items():
+        value = levels.get(key)
+        if value is not None and pd.notna(value):
+            fig.add_hline(
+                y=float(value), line_dash="dot", line_width=1,
+                line_color=color,
+                annotation_text=key,
+                annotation_position="top right"
+            )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=570,
+        margin={"l": 8, "r": 8, "t": 35, "b": 8},
+        paper_bgcolor="#0b1220",
+        plot_bgcolor="#0b1220",
+        xaxis_rangeslider_visible=False,
+        legend={"orientation": "h", "y": 1.03, "x": 0},
+        title=f"{symbol} · {interval.upper()} · latest {len(chart_df)} candles",
+        hovermode="x unified"
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#243244")
+    fig.update_yaxes(showgrid=True, gridcolor="#243244", title="Index level")
+    st.plotly_chart(fig, use_container_width=True, config={
+        "displaylogo": False, "scrollZoom": True,
+        "modeBarButtonsToRemove": ["select2d", "lasso2d"]
+    })
+
 # -------------------------- UI -------------------------------
 
 with st.sidebar:
@@ -729,42 +804,94 @@ update_open_trades({k:v.get("price",np.nan) for k,v in signals.items()}, _traili
 tabs = st.tabs(["Live Dashboard", "Levels & Structure", "Paper Trading", "Signal Journal", "Backtesting", "Data & Setup"])
 
 with tabs[0]:
-    st.subheader("Market overview")
-    cols = st.columns(3)
-    for col, name in zip(cols, INDEXES):
+    st.subheader("Live market dashboard")
+    chart_symbol = st.selectbox(
+        "Choose index for chart",
+        list(INDEXES),
+        key="live_chart_symbol"
+    )
+    chart_interval = st.selectbox(
+        "Chart timeframe",
+        ["5m", "15m", "1h", "daily"],
+        index=0,
+        key="live_chart_interval"
+    )
+
+    overview_cols = st.columns(3)
+    for col, name in zip(overview_cols, INDEXES):
         sig = signals[name]
         with col:
-            st.metric(name, f"{sig.get('price',np.nan):,.2f}" if pd.notna(sig.get("price",np.nan)) else "Unavailable")
-            side = sig["side"]
-            if side == "BUY": st.success(f"BUY · {sig['score']}/100")
-            elif side == "SELL": st.error(f"SELL · {sig['score']}/100")
-            elif side == "REVERSAL WATCH": st.warning(f"REVERSAL WATCH · {sig['score']}/100")
-            else: st.info(f"NO TRADE · {sig['score']}/100")
-            st.caption(f"1H: {sig.get('trend1h','—')} | 15m: {sig.get('trend15m','—')}")
-            st.caption(f"Last candle: {sig.get('last_time','—')}")
-            if sig["side"] in ["BUY","SELL"]:
-                st.write("**Trade plan**")
-                st.write(f"Entry: {sig['entry']:,.2f}")
-                st.write(f"SL: {sig['stop']:,.2f}")
-                st.write(f"T1: {sig['target1']:,.2f}")
-                st.write(f"T2: {sig['target2']:,.2f}")
-                if st.button(f"Open paper {name}", key=f"paper_{name}"):
-                    open_trade_from_signal(sig, qty, st.session_state.signal_ids.get(name))
-                    st.success("Paper trade recorded.")
-            st.write("**Why this signal?**")
-            for reason in sig.get("reasons",[]): st.write(f"• {reason}")
-            for warning in sig.get("warnings",[]): st.caption(f"⚠️ {warning}")
+            price = sig.get("price", np.nan)
+            st.metric(name, f"{price:,.2f}" if pd.notna(price) else "Unavailable")
+            side = sig.get("side", "NO TRADE")
+            if side == "BUY":
+                st.success(f"BUY · {sig.get('score', 0)}/100")
+            elif side == "SELL":
+                st.error(f"SELL · {sig.get('score', 0)}/100")
+            elif side == "REVERSAL WATCH":
+                st.warning(f"REVERSAL WATCH · {sig.get('score', 0)}/100")
+            else:
+                st.info(f"NO TRADE · {sig.get('score', 0)}/100")
+            st.caption(
+                f"1H: {sig.get('trend1h', '—')} | "
+                f"15m: {sig.get('trend15m', '—')}"
+            )
+            st.caption(f"Last candle: {sig.get('last_time', '—')}")
 
     st.divider()
-    st.subheader("Signal status")
+    selected_sig = signals[chart_symbol]
+    chart_col, signal_col = st.columns([2.25, 1], gap="large")
+    with chart_col:
+        st.subheader(f"{chart_symbol} price chart")
+        render_price_chart(chart_symbol, selected_sig, chart_interval)
+
+    with signal_col:
+        st.subheader("Current signal")
+        side = selected_sig.get("side", "NO TRADE")
+        score = selected_sig.get("score", 0)
+        if side == "BUY":
+            st.success(f"BUY · {score}/100")
+        elif side == "SELL":
+            st.error(f"SELL · {score}/100")
+        elif side == "REVERSAL WATCH":
+            st.warning(f"REVERSAL WATCH · {score}/100")
+        else:
+            st.info(f"NO TRADE · {score}/100")
+
+        if side in ["BUY", "SELL"]:
+            st.metric("Entry", f"{selected_sig.get('entry', np.nan):,.2f}")
+            st.metric("Stop loss", f"{selected_sig.get('stop', np.nan):,.2f}")
+            st.metric("Target 1", f"{selected_sig.get('target1', np.nan):,.2f}")
+            st.metric("Target 2", f"{selected_sig.get('target2', np.nan):,.2f}")
+            st.caption(f"Risk/reward: {selected_sig.get('rr', '—')}")
+            if st.button(f"Open paper trade — {chart_symbol}", key=f"chart_paper_{chart_symbol}"):
+                open_trade_from_signal(
+                    selected_sig, qty,
+                    st.session_state.signal_ids.get(chart_symbol)
+                )
+                st.success("Paper trade recorded.")
+        else:
+            st.caption("No confirmed trade setup at this time. Wait for the filters to align.")
+        st.markdown("**Why this signal?**")
+        for reason in selected_sig.get("reasons", []):
+            st.write(f"• {reason}")
+        for warning in selected_sig.get("warnings", []):
+            st.caption(f"⚠️ {warning}")
+
+    st.divider()
+    st.subheader("Signal status across indices")
     summary = pd.DataFrame([{
-        "Index":n, "Signal":signals[n]["side"], "Score":signals[n]["score"],
-        "Last price":signals[n].get("price"), "RSI 15m":signals[n].get("rsi15"),
-        "Futures RVOL":signals[n].get("rvol"), "VWAP 5m":signals[n].get("vwap"),
-        "Fib 1H":("IN ZONE" if signals[n].get("fib_touch") else "Outside / unavailable"),
-        "Daily trend":signals[n].get("daily_context",{}).get("trend","—"),
-        "Fib Daily":("IN ZONE" if signals[n].get("daily_fib_touch") else "Outside / unavailable"),
-        "Last candle":signals[n].get("last_time")
+        "Index": n,
+        "Signal": signals[n].get("side"),
+        "Score": signals[n].get("score"),
+        "Last price": signals[n].get("price"),
+        "RSI 15m": signals[n].get("rsi15"),
+        "Futures RVOL": signals[n].get("rvol"),
+        "VWAP 5m": signals[n].get("vwap"),
+        "Fib 1H": ("IN ZONE" if signals[n].get("fib_touch") else "Outside / unavailable"),
+        "Daily trend": signals[n].get("daily_context", {}).get("trend", "—"),
+        "Fib Daily": ("IN ZONE" if signals[n].get("daily_fib_touch") else "Outside / unavailable"),
+        "Last candle": signals[n].get("last_time")
     } for n in INDEXES])
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
